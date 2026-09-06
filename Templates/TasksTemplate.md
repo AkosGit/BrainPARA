@@ -1,36 +1,29 @@
-<%* 
+<%*
+/* Manual path: adds a board to a project that doesn't have one. New projects
+   get their board automatically from `ProjectIndexTemplate`, which builds the
+   same skeleton inline (it can't call this template — see the comment there).
+
+   ⚠️ KEEP IN SYNC with the `createBoard()` function in `ProjectIndexTemplate.md`. */
+const folderPath = tp.file.folder(true);   // e.g. "PROJECTS/Fatigue"
+const folderName = tp.file.folder();       // e.g. "Fatigue"
+
 let title = tp.file.title;
+if (title.startsWith("Untitled")) { title = folderName + " Tasks"; }
+if (title !== tp.file.title) { await tp.file.rename(title); }
 
-if (title.startsWith("Untitled")) { 
-  title = tp.file.folder(); 
-  title = title + " Tasks"
-} 
-await tp.file.rename(title);
-
-async function getArea() {
-  // Get all files in the specified folder
-	const folder = tp.file.folder();
-	const filePath = `${folder}/00000.md`;
-	console.log(filePath)
-	const file = await tp.file.find_tfile(`${tp.file.folder()}/00000.md`);
-	const metadata = app.metadataCache.getFileCache(file)?.frontmatter;
-	return metadata.Area
-}
-
-// Ensure async behavior by awaiting the results
-setTimeout(async () => {
-  const areaSelection = await getArea() // Wait for getOptions to finish
-  
-  app.fileManager.processFrontMatter(tp.config.target_file, frontmatter => {
-    frontmatter["Parent"] = `[[PROJECTS/${tp.file.folder()}/00000|Link]]`
-    frontmatter["Type"] = "Tasks";
-    frontmatter["Area"] = areaSelection;
-    frontmatter["Project"] = tp.file.folder();
-    frontmatter["kanban-plugin"] = "board"
-  });
-}, 200);
-
+const idx = app.vault.getAbstractFileByPath(`${folderPath}/00000.md`);
+const areaTags = (idx ? (app.metadataCache.getFileCache(idx)?.frontmatter?.tags ?? []) : [])
+  .map(String).filter(t => t.startsWith("area/"));
+const tagBlock = areaTags.length ? areaTags.map(t => "  - " + t).join("\n") : "  []";
 -%>
+---
+Parent: "[[<% folderPath %>/00000|Link]]"
+Type: Tasks
+Project: "<% folderName %>"
+kanban-plugin: board
+tags:
+<% tagBlock %>
+---
 
 ## Backlog
 

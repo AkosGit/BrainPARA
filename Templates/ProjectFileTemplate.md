@@ -1,73 +1,169 @@
-<%* 
-let title = tp.file.title;
-
-if (title.startsWith("Untitled")) { 
-  title = await tp.system.prompt("Title"); 
-} 
-await tp.file.rename(title);
-
-async function getArea() {
-  // Get all files in the specified folder
-	const folder = tp.file.folder();
-	const filePath = `${folder}/00000.md`;
-	console.log(filePath)
-	const file = await tp.file.find_tfile(`${tp.file.folder()}/00000.md`);
-	const metadata = app.metadataCache.getFileCache(file)?.frontmatter;
-	return metadata.Area
+<%*
+function slugify(s) {
+  return String(s).trim().toLowerCase().replace(/[^a-z0-9/]+/g, "-").replace(/^-+|-+$/g, "");
 }
-
-async function getCategory() {
-  // Get all files in the specified folder
-	const folder = tp.file.folder();
-	const filePath = `${folder}/00000.md`;
-	const file = await tp.file.find_tfile(`${tp.file.folder()}/00000.md`);
-	const metadata = app.metadataCache.getFileCache(file)?.frontmatter;
-	return metadata.Category
+function yamlList(items) {
+  return items.length ? items.map(t => "  - " + t).join("\n") : "  []";
 }
-
-
-async function getSubCategoryOptions() {
-  // Get all files in the specified folder
-  const files = app.vault.getFiles()
-
-  // Extract unique values for the `Area` property in frontmatter
-  const subcategorys = new Set();
-  for (const file of files) {
-    const metadata = app.metadataCache.getFileCache(file)?.frontmatter;
-    if (metadata && metadata.Subcategory) {
-      subcategorys.add(metadata.Subcategory);
+function yamlField(name, items) {
+  return items.length ? name + ":\n" + items.map(t => "  - " + t).join("\n") : name + ": []";
+}
+function wikiLink(file, alias) {
+  return `"[[${file.path.replace(/\.md$/, "")}|${alias ?? file.basename}]]"`;
+}
+/* Source notes this idea came from. Undigested sources are listed first. */
+async function pickSourceNotes() {
+  const chosen = [];
+  for (;;) {
+    const pool = app.vault.getMarkdownFiles()
+      .filter(f => app.metadataCache.getFileCache(f)?.frontmatter?.Type === "Source")
+      .filter(f => !chosen.some(c => c.path === f.path))
+      .sort((a, b) => {
+        const st = f => app.metadataCache.getFileCache(f)?.frontmatter?.reading_status === "integrated" ? 1 : 0;
+        return (st(a) - st(b)) || (b.stat.ctime - a.stat.ctime);
+      });
+    if (pool.length === 0) break;
+    const labels = pool.map(f => {
+      const st = app.metadataCache.getFileCache(f)?.frontmatter?.reading_status;
+      return f.basename + (st ? "  ·  " + st : "");
+    }).concat(["Done (" + chosen.length + " selected)"]);
+    const values = [...pool, "__done__"];
+    const pick = await tp.system.suggester(
+      labels, values, false, "Source note(s) this idea came from — Esc for none");
+    if (pick === "__done__" || pick === null || pick === undefined) break;
+    chosen.push(pick);
+  }
+  return chosen;
+}
+/* Write the reciprocal link back into each Source's `ideas-extracted`. */
+async function backlinkSources(sources, ideaFile, ideaTitle) {
+  if (!sources.length) return;
+  const ideaLink = `[[${ideaFile.path.replace(/\.md$/, "")}|${ideaTitle}]]`;
+  const integrate = await tp.system.suggester(
+    ["No — source still has more to give", "Yes — set reading_status: integrated"],
+    ["no", "yes"], false, `Mark ${sources.length} source note(s) as integrated?`);
+  for (const f of sources) {
+    await app.fileManager.processFrontMatter(f, fm => {
+      const list = Array.isArray(fm["ideas-extracted"]) ? fm["ideas-extracted"] : [];
+      if (!list.includes(ideaLink)) list.push(ideaLink);
+      fm["ideas-extracted"] = list;
+      if (integrate === "yes") fm["reading_status"] = "integrated";
+    });
+  }
+  new Notice(`Linked idea to ${sources.length} source note(s)`);
+}
+/* Add a link-only card to the project's kanban board. A card that is nothing
+   but a wikilink renders on the Index as the note's title — see SYSTEM.md §4.
+   The board is the source of truth for status, so the card carries no metadata. */
+async function addBoardCard(folderPath, noteFile, noteTitle) {
+  /* Ask FIRST, look for the board second. Doing it the other way round meant a
+     project without a board bailed out before prompting, so the feature looked
+     broken instead of looking like "this project has no board". */
+  const list = await tp.system.suggester(
+    ["Backlog", "In Progress", "No card"], ["Backlog", "In Progress", null],
+    false, "Add a card to the project board?");
+  if (!list) return;
+  /* Frontmatter first, then filename — a board created moments ago (by
+     ProjectIndexTemplate) may not be in the metadata cache yet. */
+  const inFolder = app.vault.getMarkdownFiles().filter(f => f.parent?.path === folderPath);
+  const board = inFolder.find(f => {
+    const fm = app.metadataCache.getFileCache(f)?.frontmatter;
+    return fm?.Type === "Tasks" || fm?.["kanban-plugin"] === "board";
+  }) ?? inFolder.find(f => /\bTasks$/i.test(f.basename));
+  if (!board) {
+    new Notice(`No board found in ${folderPath} — card skipped. Add one with TasksTemplate.`, 8000);
+    return;
+  }
+  const lines = (await app.vault.read(board)).split("\n");
+  const start = lines.findIndex(l => l.trim() === "## " + list);
+  if (start === -1) { new Notice(`No "${list}" list on the board — card skipped.`, 8000); return; }
+  /* Walk to the end of this list, then back up over trailing blank lines so the
+     card lands under the last existing card rather than in the gap below it. */
+  let end = start + 1;
+  while (end < lines.length
+      && !/^##\s/.test(lines[end])
+      && !/^%%\s*kanban:settings/.test(lines[end])) end++;
+  let last = end - 1;
+  while (last > start && lines[last].trim() === "") last--;
+  lines.splice(last + 1, 0, `- [ ] [[${noteFile.path.replace(/\.md$/, "")}|${noteTitle}]]`);
+  await app.vault.modify(board, lines.join("\n"));
+  new Notice(`Added to ${list}: ${noteTitle}`);
+}
+function allFrontmatterTags(prefix) {
+  const out = new Set();
+  for (const f of app.vault.getMarkdownFiles()) {
+    const tags = app.metadataCache.getFileCache(f)?.frontmatter?.tags;
+    if (Array.isArray(tags)) {
+      for (const t of tags) if (String(t).startsWith(prefix)) out.add(String(t));
     }
   }
-
-  // Convert the Set to an array and sort it
- let options = Array.from(subcategorys).sort();
- options.push("Other...")
- 
-
-  // Prompt the user with a dropdown menu
-  const selection = await tp.system.suggester(options, options);
-  let finalanswer = selection
-  if(selection == "Other..."){
-	finalanswer = await tp.system.prompt("New subcategory:");
-  }
-  return finalanswer;
+  return Array.from(out).sort();
 }
+async function pickAreaHub() {
+  const hubs = app.vault.getMarkdownFiles()
+    .filter(f => f.path.startsWith("AREAS/") && !f.path.slice("AREAS/".length).includes("/"));
+  const labels = hubs.map(h => h.basename).concat(["Other (new area)..."]);
+  const values = [...hubs, null];
+  const pick = await tp.system.suggester(labels, values, false, "Area (exactly one)");
+  if (pick === null || pick === undefined) {
+    const name = await tp.system.prompt("New area name (create its hub note in AREAS/ too):");
+    return { hubName: name ?? "Unsorted", tag: "area/" + slugify(name ?? "unsorted") };
+  }
+  const fm = app.metadataCache.getFileCache(pick)?.frontmatter;
+  const tag = (fm?.tags ?? []).map(String).find(t => t.startsWith("area/"))
+    ?? ("area/" + slugify(pick.basename));
+  return { hubName: pick.basename, tag: tag };
+}
+async function pickTopicTags() {
+  const chosen = [];
+  for (;;) {
+    const existing = allFrontmatterTags("topic/").filter(t => !chosen.includes(t));
+    const labels = [...existing, "+ New topic...", "Done (" + chosen.length + " selected)"];
+    const values = [...existing, "__new__", "__done__"];
+    const pick = await tp.system.suggester(labels, values, false, "Topic tags (optional)");
+    if (pick === "__done__" || pick === null || pick === undefined) break;
+    if (pick === "__new__") {
+      const raw = await tp.system.prompt("New topic (nest with '/', e.g. programming/python):");
+      if (raw) chosen.push("topic/" + slugify(raw));
+    } else {
+      chosen.push(pick);
+    }
+  }
+  return chosen;
+}
+let title = tp.file.title;
+if (title.startsWith("Untitled")) {
+  title = (await tp.system.prompt("Title")) ?? title;
+}
+if (title !== tp.file.title) { await tp.file.rename(title); }
 
+const folderPath = tp.file.folder(true);   // e.g. "PROJECTS/Fatigue"
+const folderName = tp.file.folder();       // e.g. "Fatigue"
+const idx = app.vault.getAbstractFileByPath(`${folderPath}/00000.md`);
+const idxTags = (idx ? (app.metadataCache.getFileCache(idx)?.frontmatter?.tags ?? []) : []).map(String);
 
-// Ensure async behavior by awaiting the results
-setTimeout(async () => {
-  const areaSelection = await getArea()
-  const categorySelection = await getCategory();
-  const subcategorySelection = await getSubCategoryOptions();
-  app.fileManager.processFrontMatter(tp.config.target_file, frontmatter => {
-    frontmatter["Parent"] = `[[PROJECTS/${tp.file.folder()}/00000|Link]]`
-    frontmatter["Type"] = "ProjectFile";
-    frontmatter["Area"] = areaSelection;
-    frontmatter["Category"] = categorySelection
-    frontmatter["Subcategory"] = subcategorySelection
-    frontmatter["Project"] = tp.file.folder();
-  });
-}, 200);
+const noteType = (await tp.system.suggester(
+  ["Resource", "Idea", "Source"], ["Resource", "Idea", "Source"], false, "Note type")) ?? "Resource";
+const extraTopics = await pickTopicTags();
+const tagBlock = yamlList(Array.from(new Set([...idxTags, ...extraTopics])));
 
+let ideaFields = "";
+if (noteType === "Idea") {
+  const sources = await pickSourceNotes();
+  ideaFields = "status: seed\n" + yamlField("source-notes", sources.map(f => wikiLink(f))) + "\n";
+  await backlinkSources(sources, tp.config.target_file, title);
+}
+/* A Resource inside a project is a deliverable, so it usually owes a task.
+   Ideas and Sources don't — add those cards by hand if you want them. */
+if (noteType === "Resource") {
+  await addBoardCard(folderPath, tp.config.target_file, title);
+}
 -%>
+---
+Parent: "[[<% folderPath %>/00000|Link]]"
+Type: <% noteType %>
+Project: "<% folderName %>"
+<% ideaFields %>tags:
+<% tagBlock %>
+---
 # <% title %>

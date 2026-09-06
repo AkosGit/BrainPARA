@@ -1,82 +1,145 @@
-<%* 
-let title = tp.file.title;
+<%*
+function slugify(s) {
+  return String(s).trim().toLowerCase().replace(/[^a-z0-9/]+/g, "-").replace(/^-+|-+$/g, "");
+}
+function yamlList(items) {
+  return items.length ? items.map(t => "  - " + t).join("\n") : "  []";
+}
+function allFrontmatterTags(prefix) {
+  const out = new Set();
+  for (const f of app.vault.getMarkdownFiles()) {
+    const tags = app.metadataCache.getFileCache(f)?.frontmatter?.tags;
+    if (Array.isArray(tags)) {
+      for (const t of tags) if (String(t).startsWith(prefix)) out.add(String(t));
+    }
+  }
+  return Array.from(out).sort();
+}
+async function pickAreaHub() {
+  const hubs = app.vault.getMarkdownFiles()
+    .filter(f => f.path.startsWith("AREAS/") && !f.path.slice("AREAS/".length).includes("/"));
+  const labels = hubs.map(h => h.basename).concat(["Other (new area)..."]);
+  const values = [...hubs, null];
+  const pick = await tp.system.suggester(labels, values, false, "Area (exactly one)");
+  if (pick === null || pick === undefined) {
+    const name = await tp.system.prompt("New area name (create its hub note in AREAS/ too):");
+    return { hubName: name ?? "Unsorted", tag: "area/" + slugify(name ?? "unsorted") };
+  }
+  const fm = app.metadataCache.getFileCache(pick)?.frontmatter;
+  const tag = (fm?.tags ?? []).map(String).find(t => t.startsWith("area/"))
+    ?? ("area/" + slugify(pick.basename));
+  return { hubName: pick.basename, tag: tag };
+}
+async function pickTopicTags() {
+  const chosen = [];
+  for (;;) {
+    const existing = allFrontmatterTags("topic/").filter(t => !chosen.includes(t));
+    const labels = [...existing, "+ New topic...", "Done (" + chosen.length + " selected)"];
+    const values = [...existing, "__new__", "__done__"];
+    const pick = await tp.system.suggester(labels, values, false, "Topic tags (optional)");
+    if (pick === "__done__" || pick === null || pick === undefined) break;
+    if (pick === "__new__") {
+      const raw = await tp.system.prompt("New topic (nest with '/', e.g. programming/python):");
+      if (raw) chosen.push("topic/" + slugify(raw));
+    } else {
+      chosen.push(pick);
+    }
+  }
+  return chosen;
+}
+/* The project's kanban board, created alongside this index.
 
-if (title.startsWith("Untitled")) { 
-  title = "00000"; 
-} 
+   This deliberately does NOT invoke `TasksTemplate`: that template reads the
+   project index's frontmatter out of the metadata cache to inherit the area
+   tag, and at this moment the index note has not been written yet — the cache
+   would come back empty and the board would land with `tags: []`. Same class of
+   race as the v2.0 frontmatter bug (SYSTEM.md §3). So the board is emitted from
+   the variables already in hand.
+
+   ⚠️ KEEP IN SYNC with `TasksTemplate.md` — the two produce the same skeleton
+   and `TasksTemplate` is still the manual path for a project that has no board. */
+async function createBoard(folderPath, folderName, areaTag) {
+  const existing = app.vault.getMarkdownFiles()
+    .filter(f => f.parent?.path === folderPath)
+    .find(f => app.metadataCache.getFileCache(f)?.frontmatter?.Type === "Tasks");
+  if (existing) return;
+  const path = `${folderPath}/${folderName} Tasks.md`;
+  if (app.vault.getAbstractFileByPath(path)) return;
+  const body = [
+    "---",
+    `Parent: "[[${folderPath}/00000|Link]]"`,
+    "Type: Tasks",
+    `Project: "${folderName}"`,
+    "kanban-plugin: board",
+    "tags:",
+    areaTag ? "  - " + areaTag : "  []",
+    "---",
+    "",
+    "## Backlog",
+    "",
+    "## In Progress",
+    "",
+    "## Done",
+    "",
+    "%% kanban:settings",
+    "```",
+    '{"kanban-plugin":"board","list-collapse":[false,false,false],"show-checkboxes":false}',
+    "```",
+    "%%",
+    "",
+  ].join("\n");
+  try {
+    await app.vault.create(path, body);
+    new Notice(`Board created: ${folderName} Tasks`);
+  } catch (e) {
+    new Notice(`Board not created: ${e.message}`);
+  }
+}
+let title = tp.file.title;
+if (title.startsWith("Untitled")) { title = "00000"; }
 await tp.file.rename(title);
 
-async function getCategoryOptions() {
-  // Get all files in the specified folder
-  const files = app.vault.getFiles()
+const area = await pickAreaHub();
+const topics = await pickTopicTags();
+const tagBlock = yamlList([area.tag, ...topics]);
 
-  // Extract unique values for the `Area` property in frontmatter
-  const categorys = new Set();
-  for (const file of files) {
-    const metadata = app.metadataCache.getFileCache(file)?.frontmatter;
-    if (metadata && metadata.Category) {
-      categorys.add(metadata.Category);
-    }
-  }
-
-  // Convert the Set to an array and sort it
- let options = Array.from(categorys).sort();
- options.push("Other...")
- 
-
-  // Prompt the user with a dropdown menu
-  const selection = await tp.system.suggester(options, options);
-  let finalanswer = selection
-  if(selection == "Other..."){
-	finalanswer = await tp.system.prompt("New category:");
-  }
-  return finalanswer;
-}
-
-async function getOptions(folderPath) {
-  // Get all files in the specified folder
-  const files = app.vault.getFiles().filter(file => file.path.startsWith(folderPath + "/"));
-
-  // Extract unique values for the `Area` property in frontmatter
-  const areaValues = new Set();
-  for (const file of files) {
-    const metadata = app.metadataCache.getFileCache(file)?.frontmatter;
-    if (metadata && metadata.Area) {
-      areaValues.add(metadata.Area);
-    }
-  }
-
-  // Convert the Set to an array and sort it
-  const options = Array.from(areaValues).sort();
-
-  // Prompt the user with a dropdown menu
-  const selection = await tp.system.suggester(options, options);
-  return selection;
-}
-
-// Async function for frontmatter processing
-async function updateFrontmatter() {
-  const areaSelection = await getOptions("AREAS");  // Await the result of getOptions
-  const projectFolder = tp.file.folder();  // Get the folder of the current file
-  const categorySelection = await getCategoryOptions()
-  await app.fileManager.processFrontMatter(tp.config.target_file, frontmatter => {
-    frontmatter["Parent"] = `[[AREAS/${areaSelection}/00000|Link]]`
-    frontmatter["Type"] = "Project";
-    frontmatter["Area"] = areaSelection;  // Assign selected area
-    frontmatter["Category"] = categorySelection;
-    frontmatter["Project"] = tp.file.folder();  // Assign selected project
-	frontmatter["tags"] = []
-  });
-}
-
-// Call the update function
-updateFrontmatter();
-
+await createBoard(tp.file.folder(true), tp.file.folder(), area.tag);
 -%>
+---
+Parent: "[[AREAS/<% area.hubName %>|Link]]"
+Type: Index
+Project: "<% tp.file.folder() %>"
+tags:
+<% tagBlock %>
+---
 # <% tp.file.folder() %>
 
-## Project files 
-```dataview 
-LIST 
-WHERE contains(file.folder, this.file.folder) AND file.name != "00000"
+## Tasks board
+```dataview
+LIST
+WHERE file.folder = this.file.folder AND Type = "Tasks"
+```
+
+## Project files by topic
+```dataviewjs
+const folder = dv.current().file.folder;
+const pages = dv.pages(`"${folder}"`).where(p => p.file.name !== "00000" && p.Type !== "Tasks");
+const groups = {};
+for (const p of pages) {
+  const topics = Array.from(p.file.etags ?? []).map(String).filter(t => t.startsWith("#topic/"));
+  if (topics.length === 0) { (groups["(no topic)"] ??= []).push(p); }
+  for (const t of topics) { (groups[t] ??= []).push(p); }
+}
+const keys = Object.keys(groups).sort();
+if (keys.length === 0) { dv.paragraph("*No project files yet.*"); }
+for (const key of keys) {
+  dv.header(3, String(key).replace("#topic/", ""));
+  dv.table(["Note", "Type"], groups[key].map(p => [p.file.link, p.Type]));
+}
+```
+
+## All project files
+```dataview
+TABLE Type
+WHERE file.folder = this.file.folder AND file.name != "00000"
 ```
